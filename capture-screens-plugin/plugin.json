@@ -1,0 +1,5 @@
+{
+  "name": "capture-screens",
+  "version": "1.0.0",
+  "description": "Playwright workflow for capturing fashion site screenshots into Figma frames"
+}
