@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp": {
+      "type": "http",
+      "url": "${MCP_PROXY_BASE_URL}/proxy/figma-assistant-mcp/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_PROXY_AUTH_TOKEN}"
+      }
+    }
+  },
+  "commandDefaultsFile": "command-defaults.json"
+}
