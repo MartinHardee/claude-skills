@@ -38,6 +38,15 @@ Download Debian Bullseye .deb packages and extract with `dpkg -x`. Several packa
       /home/foundry/.cache/ms-playwright/firefox-1509/firefox/firefox --version
     # Should print: Mozilla Firefox 146.0.1
 
+### Installing Firefox (if not present)
+
+If `/home/foundry/.cache/ms-playwright/firefox-1509/` doesn't exist, install it with:
+
+    PLAYWRIGHT_BROWSERS_PATH=/home/foundry/.cache/ms-playwright \
+      node /services/foundry/foundry.runfiles/_main/node_modules/.aspect_rules_js/playwright@1.58.1/node_modules/playwright/cli.js install firefox
+
+The install prints host-validation warnings about missing system libs — these are harmless. The binary will work once `chrome_libs` is rebuilt.
+
 ### Inter font
 
 Download once per session to `/tmp/inter.woff2`. Route all font requests to it:
@@ -63,6 +72,29 @@ Then inject post-load (see Font Injection section).
                     break
     "
     chmod +x /tmp/ffmpeg_h264
+
+---
+
+## Browser Launch — Anti-Bot Settings
+
+Always launch Firefox with these additional preferences to avoid automation detection. `dom.webdriver.enabled: false` hides the webdriver flag; `privacy.resistFingerprinting: false` makes the browser fingerprint look more like a real user.
+
+    const browser = await firefox.launch({
+      headless: true,
+      executablePath: FF,
+      firefoxUserPrefs: {
+        'gfx.downloadable_fonts.enabled': true,
+        'gfx.downloadable_fonts.fallback_delay': -1,
+        'intl.accept_languages': 'en-GB, en',
+        'geo.enabled': false,
+        'dom.webdriver.enabled': false,          // hide automation flag
+        'privacy.resistFingerprinting': false,    // more like a real browser
+        'javascript.options.ion': true,
+        'javascript.options.native_regexp': true,
+      },
+    });
+
+**Note:** Even with these settings, some sites (H&M, Hollister) remain blocked. See Known Sites & Quirks below.
 
 ---
 
@@ -99,6 +131,8 @@ Then inject post-load (see Font Injection section).
         'gfx.downloadable_fonts.fallback_delay': -1,
         'intl.accept_languages': 'en-GB, en',
         'geo.enabled': false,
+        'dom.webdriver.enabled': false,
+        'privacy.resistFingerprinting': false,
       },
     });
     const ctx = await browser.newContext({
@@ -178,24 +212,97 @@ Use a mobile UA and 430px viewport. **Critical: do NOT pass `isMobile: true` or 
 
 ---
 
+## Font Strategy
+
+### Option A — Inter for all (simple, default)
+
+Intercept every font request and return Inter. Fast and consistent, but **replaces icon fonts with Latin characters (gibberish)**. Use only for sites that don't use icon fonts.
+
+    await page.route(/\.(woff2?|ttf|otf)(\?.*)?$/, route => route.fulfill(INTER_RESPONSE));
+
+### Option B — Smart font routing (recommended)
+
+Let fonts that load successfully pass through; substitute Inter only for fonts that fail (network error, CORS block, 4xx). This preserves icon fonts while still providing a consistent fallback for blocked custom text fonts.
+
+    await page.route(/\.(woff2?|ttf|otf)(\?.*)?$/, async (route) => {
+      try {
+        const response = await route.fetch({ timeout: 8000 });
+        if (response.ok()) {
+          await route.fulfill({ response });
+          return;
+        }
+      } catch {}
+      // Font failed — fall back to Inter
+      await route.fulfill(INTER_RESPONSE);
+    });
+
+**When to use Option B:** any site where you saw icon font gibberish with Option A (squares, question marks, random Latin chars in icon slots). Uniqlo uses this.
+
+### Font Injection
+
+**Critical rule: inject AFTER `page.goto()`, never in `addInitScript`.**
+
+Sites load their own CSS with `!important` after `addInitScript` runs, overriding any style injected there. Using `page.evaluate()` post-load appends the style last, so it wins.
+
+**Critical rule: pass `interB64` (the outer variable) as the argument to `page.evaluate`.**
+
+The callback parameter name (`b64`) is the local name inside the callback. The second argument to `page.evaluate` must be the variable from the outer scope:
+
+    // CORRECT
+    await page.evaluate((b64) => { /* uses b64 */ }, interB64);
+
+    // WRONG — b64 is not defined in outer scope, causes silent failure
+    await page.evaluate((b64) => { /* uses b64 */ }, b64);
+
+Embed Inter as a base64 data URI — avoids URL resolution issues in headless context:
+
+    const dataUri = `data:font/woff2;base64,${interB64}`;
+
+Target selector must include pseudo-elements:
+
+    html *, html *::before, html *::after { font-family: "_I", monospace !important; }
+
+Call `injectFonts()` twice: once before scrolling, once after — dynamic content added during scroll may not have the override applied.
+
+---
+
 ## Popup Dismissal
 
 Many sites show cookie consent, geolocation/region, and newsletter popups. Dismiss them in multiple rounds.
 
-**Include geolocation/region texts** — sites like EME Studios show "WE NOTICED YOU'RE BROWSING IN A DIFFERENT LOCATION" with buttons like "CONTINUE IN UNITED KINGDOM":
+**Use specific selectors first (faster and more reliable), then fall back to text matching:**
 
     const dismissAll = async (page) => {
+      // OneTrust and other common frameworks
+      const specificSelectors = [
+        '#onetrust-accept-btn-handler',    // Adidas, Uniqlo
+        '.js-accept-all-cookies',
+        '[data-testid="cookie-accept"]',
+        '#CybotCookiebotDialogBodyButtonAccept',
+        '.optanon-allow-all',
+      ];
+      for (const sel of specificSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (el && await el.isVisible()) { await el.click(); break; }
+        } catch {}
+      }
+
+      // Text-based fallback
       const clicked = await page.evaluate(() => {
         const texts = [
           'continue in united kingdom', 'continue in uk', 'stay in united kingdom',
-          'accept all', 'accept cookies', 'allow all', 'i accept', 'agree', 'allow cookies', 'accept',
+          'accept all', 'accept all cookies', 'allow all', 'allow all cookies',
+          'accept & continue', 'accept and continue', 'accept cookies',
+          'i accept', 'agree', 'i agree', 'accept', 'got it', 'ok', 'confirm',
+          'allow', 'save preferences',
           'no thanks', 'no, thanks', 'dismiss', 'skip', 'close', 'not now',
         ];
         for (const btn of document.querySelectorAll('button, [role="button"], a')) {
           const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-          if (texts.some(t => txt.includes(t))) { btn.click(); return txt; }
+          if (txt.length < 60 && texts.some(t => txt === t || txt.includes(t))) { btn.click(); return txt; }
         }
-        // Also try × / ✕ close icons
+        // × / ✕ close icons
         for (const btn of document.querySelectorAll('button, [role="button"]')) {
           const html = btn.innerHTML || '';
           if (html.includes('×') || html.includes('✕') || html.includes('&times;')) { btn.click(); return 'close icon'; }
@@ -236,34 +343,6 @@ Sites like ASOS use IntersectionObserver and require slower scroll to trigger im
       await page.evaluate(p => window.scrollTo(0, p), y).catch(() => {});
       await page.waitForTimeout(150);
     }
-
----
-
-## Font Injection
-
-**Critical rule: inject AFTER `page.goto()`, never in `addInitScript`.**
-
-Sites load their own CSS with `!important` after `addInitScript` runs, overriding any style injected there. Using `page.evaluate()` post-load appends the style last, so it wins.
-
-**Critical rule: pass `interB64` (the outer variable) as the argument to `page.evaluate`.**
-
-The callback parameter name (`b64`) is the local name inside the callback. The second argument to `page.evaluate` must be the variable from the outer scope:
-
-    // CORRECT
-    await page.evaluate((b64) => { /* uses b64 */ }, interB64);
-
-    // WRONG — b64 is not defined in outer scope, causes silent failure
-    await page.evaluate((b64) => { /* uses b64 */ }, b64);
-
-Embed Inter as a base64 data URI — avoids URL resolution issues in headless context:
-
-    const dataUri = `data:font/woff2;base64,${interB64}`;
-
-Target selector must include pseudo-elements:
-
-    html *, html *::before, html *::after { font-family: "_I", monospace !important; }
-
-Call `injectFonts()` twice: once before scrolling, once after — dynamic content added during scroll may not have the override applied.
 
 ---
 
@@ -351,6 +430,23 @@ Take a `fullPage: true` screenshot then crop to 4000px with this pure-Python PNG
 
 Usage: `python3 /tmp/crop_png.py full.png cropped.png 4000`
 
+**For very tall pages (Zara, etc.):** Some pages exceed Firefox's 32,767px rendering limit and `fullPage: true` throws `Protocol error: Cannot take screenshot larger than 32767`. Use `clip` mode instead:
+
+    const pageHeight = await page.evaluate(() =>
+      Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+    ).catch(() => 5000);
+
+    if (pageHeight > 30000) {
+      // Use clip instead of fullPage to avoid Firefox 32,767px rendering limit
+      await page.screenshot({
+        path: outPath,
+        clip: { x: 0, y: 0, width: viewportWidth, height: Math.min(pageHeight, 4000) },
+      });
+    } else {
+      await page.screenshot({ path: fullPath, fullPage: true });
+      execSync(`python3 /tmp/crop_png.py ${fullPath} ${outPath} 4000`);
+    }
+
 ---
 
 ## Uploading to Figma
@@ -366,8 +462,11 @@ The `upload_assets` `nodeId` parameter is unreliable — the upload succeeds but
 
         const node = await figma.getNodeByIdAsync('296:19');
         node.fills = [{ type: 'IMAGE', imageHash: 'abc123...', scaleMode: 'FILL' }];
+        node.resize(width, height);  // resize frame to match image dimensions
         const stray = await figma.getNodeByIdAsync('373:2');
         if (stray) stray.remove();
+
+**Always resize the Figma frame** to match the captured image dimensions after setting the fill, so the image renders at 1:1 pixel density rather than being scaled.
 
 ---
 
@@ -375,15 +474,19 @@ The `upload_assets` `nodeId` parameter is unreliable — the upload succeeds but
 
 | Site | Notes |
 |------|-------|
+| asos.com | Heavy lazy loading — use slow scroll (150px/150ms). Cookie banner: text "allow all" |
+| adidas.co.uk | OneTrust cookie banner — click `#onetrust-accept-btn-handler` first, then text fallback. Accept text is "accept all cookies" |
 | browniespain.com | Country selector: `button.brn-country-selector__button` ("Go!"). Full-viewport video hero — extract frame from MP4 with ffmpeg. Remove `.brn-gift-sheet`, `.brn-gift-drawer__overlay`, `[class*="country-selector"]` |
 | uk.brandymelville.com | UK domain (not `brandymelvilleusa.com`). No video hero. Font fix required. |
-| emestudios.com | Shows geolocation/region popup "CONTINUE IN UNITED KINGDOM" — requires multi-round dismissal including geolocation texts, ESC press, and z-index overlay removal |
-| asos.com | Heavy lazy loading — use slow scroll (150px/150ms) instead of standard 300px/200ms |
-| zara.com/uk/en | Mobile gendered URLs (`man-mkt1093`, `woman-mkt1040`) both redirect to new-in pages regardless of gender — results in same hash for both |
+| emestudios.com | Two-layer popup: cookie "accept" first, then geolocation "CONTINUE IN UNITED KINGDOM" — requires multi-round dismissal |
+| uniqlo.com | OneTrust cookie banner (`#onetrust-accept-btn-handler`). Use **smart font routing** (Option B) — standard Inter routing replaces icon fonts with gibberish |
+| subdued.com | Cookie close icon (×) — use icon-based dismissal fallback |
+| zara.com/uk/en | Mobile gendered URLs (`man-mkt1093`, `woman-mkt1040`) redirect to new-in pages. Desktop pages can be 33,000px+ — use clip mode, not fullPage (see Cropping section) |
 | pullandbear.com | Headless bot detection — returns minimal content, page height = viewport only |
-| urbanoutfitters.com | Headless bot detection — returns minimal content |
-| coldculture.com | Headless bot detection — returns minimal content |
-| hm.com | Blocked by Cloudflare — cannot capture from this environment |
+| urbanoutfitters.com | Headless bot detection — returns minimal content (900px). dom.webdriver=false does not bypass this |
+| coldcultureworldwide.com | Headless bot detection — returns minimal content |
+| hm.com | **Blocked by Cloudflare** — cannot capture from this environment. dom.webdriver=false does not bypass Cloudflare. Requires a real browser session or residential proxy service |
+| hollisterco.com | **Blocked by Cloudflare/bot detection** — returns 88px of content (error stub). dom.webdriver=false does not bypass this |
 
 ---
 
@@ -392,6 +495,7 @@ The `upload_assets` `nodeId` parameter is unreliable — the upload succeeds but
 - **Blank content / tiny screenshot:** viewport height set to 4000 — change to 900 + fullPage:true
 - **Broken/emoji fonts:** font injection in `addInitScript` — move to `page.evaluate()` after `page.goto()`
 - **Font injection silently failing:** `injectFonts` passes wrong variable to `page.evaluate` — ensure second arg is `interB64` (outer scope), not `b64` (local name)
+- **Icon font gibberish (squares/random chars):** Option A font routing replaces icon fonts — switch to Option B (smart font routing)
 - **Blank video hero area:** H.264 video — detect via `video.networkState === 3`, extract frame with static ffmpeg
 - **LD_LIBRARY_PATH error / browser crash:** missing `/tmp/chrome_libs/lib/` path (dbus) — add both `/usr/lib/` and `/lib/` variants; check `/tmp/chrome_libs` was rebuilt (wiped each session)
 - **`libgmodule-2.0.so.0` not found:** libglib2.0-0 missing — download from `security.debian.org`, not `deb.debian.org`
@@ -400,8 +504,10 @@ The `upload_assets` `nodeId` parameter is unreliable — the upload succeeds but
 - **`libasound.so.2` not found:** download libasound2 from packages.debian.org
 - **`zlib.error: Error -5` in crop_png:** only decompressing first IDAT chunk — concatenate ALL IDAT chunks before decompressing
 - **`isMobile is not supported in Firefox`:** removed `isMobile: true` and `hasTouch: true` from `browser.newContext()` — Firefox doesn't support these
+- **`Protocol error: Cannot take screenshot larger than 32767`:** page is very tall — use clip mode with explicit height instead of fullPage:true (see Cropping section)
 - **MP4 download fails:** try the SD version of the video URL if HD is blocked
 - **Figma fill not updating:** use the two-step imageHash approach above, not `upload_assets` with `nodeId`
 - **Popup still showing after dismissal:** site has multiple popup layers (cookie + region + newsletter) — use multi-round loop with ESC + z-index overlay removal; add region-specific texts to click list
 - **Images not loading below fold (ASOS-style sites):** use slow scroll (150px/150ms) to trigger IntersectionObserver reliably
-- **Page height = 900 (viewport only) for mobile:** site detects headless browser and returns skeleton only — no fix available
+- **Page height = 900 (viewport only) for desktop:** site detects headless browser and returns skeleton only — no fix available with dom.webdriver=false; requires real browser or proxy
+- **Firefox binary missing after session restart:** /home/foundry/.cache/ms-playwright/ is persistent but verify with `firefox --version`; if gone, reinstall with `playwright cli install firefox`
